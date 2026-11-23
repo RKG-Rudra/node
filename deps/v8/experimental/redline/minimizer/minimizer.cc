@@ -5,6 +5,7 @@
 #include "experimental/redline/minimizer/minimizer.h"
 
 #include <algorithm>
+#include <cmath>
 #include <limits>
 #include <map>
 #include <unordered_set>
@@ -49,6 +50,10 @@ bool MinimizationHelper::BudgetExhausted() const {
     return true;
   }
   return false;
+}
+
+int MinimizationHelper::TestsLeft() const {
+  return std::max(0, options_.max_tests - result_.tests);
 }
 
 bool MinimizationHelper::Test() {
@@ -265,10 +270,42 @@ class Truncator : public Reducer {
   }
 };
 
+// The identifiers that declare a binding without references.
+std::unordered_set<const fast::Identifier*> UnreferencedIdentifiers(
+    const fast::ScopeAnalysis& scopes) {
+  std::unordered_set<const fast::Identifier*> unreferenced;
+  for (const fast::Binding* binding : scopes.bindings()) {
+    if (binding->references.empty() && binding->identifier != nullptr) {
+      unreferenced.insert(binding->identifier);
+    }
+  }
+  return unreferenced;
+}
+
+// True if `stmt` is a variable declaration whose declarators all declare an
+// identifier in `unreferenced`.
+bool IsUnreferencedDeclaration(
+    const Statement* stmt,
+    const std::unordered_set<const fast::Identifier*>& unreferenced) {
+  const auto* decl = stmt->As<fast::VariableDeclaration>();
+  if (decl == nullptr || decl->declarations.empty()) {
+    return false;
+  }
+  for (const fast::VariableDeclarator* d : decl->declarations) {
+    const auto* id =
+        d->target != nullptr ? d->target->As<fast::Identifier>() : nullptr;
+    if (id == nullptr || unreferenced.count(id) == 0) {
+      return false;
+    }
+  }
+  return true;
+}
+
 // Removes the parts of the program that the rest does not use: the
 // top-level statements form a graph in which two statements are connected
 // when one references a binding the other declares (scope analysis
-// resolves every identifier). Each connected part that does not contain
+// resolves every identifier). First one test removes all unused variable
+// declarations together. Then each connected part that does not contain
 // every statement is removed with one test. Side effects through globals,
 // prototypes or getters can connect statements that share no binding, so
 // the graph only proposes the cut; the oracle decides.
@@ -284,7 +321,10 @@ class DataflowReducer : public Reducer {
     if (body == nullptr || body->size() < 2) {
       return 0;
     }
-    std::vector<std::vector<size_t>> parts = Parts(helper.tree(), *body);
+    std::unique_ptr<fast::ScopeAnalysis> scopes =
+        fast::ScopeAnalysis::Analyze(helper.tree());
+    std::vector<std::vector<size_t>> parts =
+        Parts(helper.tree(), *body, *scopes);
     if (parts.size() < 2) {
       return 0;
     }
@@ -293,27 +333,45 @@ class DataflowReducer : public Reducer {
               [](const auto& a, const auto& b) { return a.back() > b.back(); });
     const std::vector<Statement*> all = *body;
     std::vector<bool> removed(all.size(), false);
+    // Removes the statements of `indices` if the oracle accepts it.
+    auto try_remove = [&](const std::vector<size_t>& indices) {
+      for (size_t index : indices) {
+        removed[index] = true;
+      }
+      Assign(all, removed, body);
+      if (!body->empty() && helper.Test()) {
+        return true;
+      }
+      for (size_t index : indices) {
+        removed[index] = false;
+      }
+      return false;
+    };
     int accepted = 0;
+    // First remove all unused declarations with one test, as the
+    // `statements` reducer does. A program often has many of them, for
+    // example the values of the prefix stage.
+    const std::unordered_set<const fast::Identifier*> unreferenced =
+        UnreferencedIdentifiers(*scopes);
+    std::vector<size_t> unused;
+    for (const std::vector<size_t>& part : parts) {
+      if (part.size() == 1 &&
+          IsUnreferencedDeclaration(all[part[0]], unreferenced)) {
+        unused.push_back(part[0]);
+      }
+    }
+    if (unused.size() >= 2 && !helper.BudgetExhausted() && try_remove(unused)) {
+      accepted++;
+    }
     for (const std::vector<size_t>& part : parts) {
       if (helper.BudgetExhausted()) {
         break;
       }
-      for (size_t index : part) {
-        removed[index] = true;
-      }
-      Assign(all, removed, body);
-      if (body->empty()) {
-        for (size_t index : part) {
-          removed[index] = false;
-        }
+      if (removed[part[0]]) {
         continue;
       }
-      if (helper.Test()) {
+      if (try_remove(part)) {
         accepted++;
-        continue;
-      }
-      for (size_t index : part) {
-        removed[index] = false;
       }
     }
     Assign(all, removed, body);
@@ -333,8 +391,9 @@ class DataflowReducer : public Reducer {
 
   // The connected parts of the def-use graph of the top-level statements,
   // each as a sorted list of statement indices.
-  static std::vector<std::vector<size_t>> Parts(fast::Tree* tree,
-                                                const StatementList& body) {
+  static std::vector<std::vector<size_t>> Parts(
+      fast::Tree* tree, const StatementList& body,
+      const fast::ScopeAnalysis& scopes) {
     // Which top-level statement each node belongs to.
     constexpr size_t kNone = std::numeric_limits<size_t>::max();
     std::vector<size_t> owner(tree->id_limit(), kNone);
@@ -357,13 +416,11 @@ class DataflowReducer : public Reducer {
       }
       return x;
     };
-    std::unique_ptr<fast::ScopeAnalysis> scopes =
-        fast::ScopeAnalysis::Analyze(tree);
     auto owner_of = [&](const Node* node) {
       return node != nullptr && node->id < owner.size() ? owner[node->id]
                                                         : kNone;
     };
-    for (const fast::Binding* binding : scopes->bindings()) {
+    for (const fast::Binding* binding : scopes.bindings()) {
       size_t declared = owner_of(binding->identifier);
       if (declared == kNone) {
         continue;
@@ -396,7 +453,7 @@ class StatementRemover : public Reducer {
       : Reducer("statements", "remove statements (chunks, then one by one)") {}
 
   int Reduce(MinimizationHelper& helper) override {
-    int accepted = 0;
+    int accepted = PruneUnreferencedDeclarations(helper);
     std::unordered_set<StatementList*> done;
     while (!helper.BudgetExhausted()) {
       StatementList* list = nullptr;
@@ -414,6 +471,46 @@ class StatementRemover : public Reducer {
       accepted += TrimList(*list, 0, helper);
     }
     return accepted;
+  }
+
+ private:
+  // Removes top-level VariableDeclaration statements whose bindings have
+  // zero references in one probe before TrimList runs.
+  static int PruneUnreferencedDeclarations(MinimizationHelper& helper) {
+    if (helper.BudgetExhausted()) {
+      return 0;
+    }
+    StatementList* body = StatementListOf(helper.tree()->root());
+    if (body == nullptr || body->size() < 2) {
+      return 0;
+    }
+    std::unique_ptr<fast::ScopeAnalysis> scopes =
+        fast::ScopeAnalysis::Analyze(helper.tree());
+    const std::unordered_set<const fast::Identifier*> unreferenced =
+        UnreferencedIdentifiers(*scopes);
+    if (unreferenced.empty()) {
+      return 0;
+    }
+    std::vector<Statement*> kept;
+    kept.reserve(body->size());
+    size_t removed_count = 0;
+    for (Statement* stmt : *body) {
+      if (IsUnreferencedDeclaration(stmt, unreferenced)) {
+        removed_count++;
+      } else {
+        kept.push_back(stmt);
+      }
+    }
+    if (removed_count < 2 || kept.empty()) {
+      return 0;
+    }
+    std::vector<Statement*> saved = std::move(*body);
+    *body = std::move(kept);
+    if (helper.Test()) {
+      return 1;
+    }
+    *body = std::move(saved);
+    return 0;
   }
 };
 
@@ -696,14 +793,20 @@ class ExpressionSimplifier : public Reducer {
 
   int Reduce(MinimizationHelper& helper) override {
     int accepted = 0;
+    // The reducer stops after its part of the remaining budget
+    // (MinimizerOptions::expressions_share).
+    const int last_test = helper.result().tests + Share(helper);
+    auto exhausted = [&] {
+      return helper.BudgetExhausted() || helper.result().tests >= last_test;
+    };
     // (slot, alternative index) pairs that were already rejected.
     std::unordered_set<uint64_t> failed;
     bool progress = true;
-    while (progress && !helper.BudgetExhausted()) {
+    while (progress && !exhausted()) {
       progress = false;
       std::vector<Slot> slots = CollectSlots(helper.tree()->root());
       for (const Slot& s : slots) {
-        if (helper.BudgetExhausted()) {
+        if (exhausted()) {
           break;
         }
         Node** slot = s.field;
@@ -741,6 +844,16 @@ class ExpressionSimplifier : public Reducer {
   }
 
  private:
+  // The tests that this reducer can use in this call.
+  static int Share(const MinimizationHelper& helper) {
+    const double share = helper.options().expressions_share;
+    const int left = helper.TestsLeft();
+    if (share >= 1.0) {
+      return left;
+    }
+    return static_cast<int>(std::ceil(std::max(0.0, share) * left));
+  }
+
   static bool IsAtomic(const Expression* e) {
     switch (e->kind) {
       case NodeKind::kIdentifier:
@@ -837,12 +950,9 @@ class ExpressionSimplifier : public Reducer {
         case NodeKind::kSwitchCase:
           add(node->Cast<fast::SwitchCase>()->test);
           break;
-        case NodeKind::kCallExpression: {
-          auto* n = node->Cast<fast::CallExpression>();
-          add(n->callee);
-          add_list(n->arguments);
+        case NodeKind::kCallExpression:
+          add_list(node->Cast<fast::CallExpression>()->arguments);
           break;
-        }
         case NodeKind::kNewExpression:
           add_list(node->Cast<fast::NewExpression>()->arguments);
           break;
@@ -873,7 +983,6 @@ class ExpressionSimplifier : public Reducer {
         }
         case NodeKind::kMemberExpression: {
           auto* n = node->Cast<fast::MemberExpression>();
-          add(n->object);
           if (n->computed) {
             add(n->property);
           }
@@ -1011,8 +1120,11 @@ class ExpressionSimplifier : public Reducer {
       default:
         break;
     }
-    out.push_back(mk::Num(tree, 0));
-    out.push_back(mk::Undefined(tree));
+    if (!e->Is<fast::FunctionExpression>() &&
+        !e->Is<fast::ArrowFunctionExpression>() &&
+        !e->Is<fast::ClassExpression>()) {
+      out.push_back(mk::Num(tree, 0));
+    }
     return out;
   }
 };
@@ -1034,9 +1146,11 @@ std::vector<std::unique_ptr<Reducer>> Minimizer::CreateDefaultReducers() {
   reducers.push_back(std::make_unique<Unwrapper>());
   reducers.push_back(std::make_unique<ListTrimmer>());
   reducers.push_back(std::make_unique<ExpressionSimplifier>());
-  // Not in the default order (see DefaultOrder): on crash reproducers they
-  // reach the same result as `statements` with 5-12% more tests. Enable
-  // them with stages.minimize.reducers or `minimize --reducer=`.
+  // `truncate` is not in the default order (see DefaultOrder). The crash
+  // order (see CrashOrder) runs it. Enable it for corpus programs with
+  // stages.minimize.reducers or `minimize --reducer=`. `dataflow` is first
+  // in both orders. It removes each group of unused top-level statements
+  // with one test, for example unused prelude statements of a crash.
   reducers.push_back(std::make_unique<Truncator>());
   reducers.push_back(std::make_unique<DataflowReducer>());
   return reducers;
@@ -1046,8 +1160,18 @@ std::vector<std::unique_ptr<Reducer>> Minimizer::CreateDefaultReducers() {
 const std::vector<std::string_view>& Minimizer::DefaultOrder() {
   // Never deleted: no destructor runs when the process exits.
   static const std::vector<std::string_view>* const kOrder =
-      new std::vector<std::string_view>{"statements", "unwrap", "lists",
-                                        "expressions"};
+      new std::vector<std::string_view>{"dataflow", "statements", "unwrap",
+                                        "lists", "expressions"};
+  return *kOrder;
+}
+
+// static
+const std::vector<std::string_view>& Minimizer::CrashOrder() {
+  // The process keeps this vector until it exits. Thus no destructor runs at
+  // the exit.
+  static const std::vector<std::string_view>* const kOrder =
+      new std::vector<std::string_view>{"dataflow", "statements",  "unwrap",
+                                        "lists",    "expressions", "truncate"};
   return *kOrder;
 }
 
@@ -1108,19 +1232,38 @@ MinimizationResult Minimizer::MinimizeWith(
   Stopwatch stopwatch;
   MinimizationHelper helper(tree, oracle, checker, options);
   helper.mutable_result()->nodes_before = fast::CountNodes(tree->root());
+  // The loop below ends with a break, except after max_rounds rounds.
+  MinimizationStop stop = MinimizationStop::kRounds;
+  int last_changer = -1;
   for (int round = 0; round < options.max_rounds; round++) {
     int accepted = 0;
-    for (Reducer* reducer : reducers) {
+    bool fixed_point = false;
+    for (size_t i = 0; i < reducers.size(); i++) {
+      if (last_changer == static_cast<int>(i)) {
+        fixed_point = true;
+        break;
+      }
       if (helper.BudgetExhausted()) {
         break;
       }
+      Reducer* reducer = reducers[i];
       helper.set_reducer(reducer);
       reducer->stats().invocations++;
       int n = reducer->Reduce(helper);
       reducer->stats().produced += static_cast<uint64_t>(n);
       accepted += n;
+      if (n > 0) {
+        last_changer = static_cast<int>(i);
+      }
     }
-    if (accepted == 0 || helper.BudgetExhausted()) {
+    // A reducer stops at the end of the budget. Then the round is not
+    // complete, so it does not show a fixed point.
+    if (helper.BudgetExhausted()) {
+      stop = MinimizationStop::kBudget;
+      break;
+    }
+    if (fixed_point || accepted == 0) {
+      stop = MinimizationStop::kFixedPoint;
       break;
     }
   }
@@ -1130,7 +1273,24 @@ MinimizationResult Minimizer::MinimizeWith(
   result.nodes_after = fast::CountNodes(tree->root());
   result.time_us = stopwatch.ElapsedUs();
   result.budget_exhausted = helper.BudgetExhausted();
+  result.stop = stop;
   return result;
+}
+
+const char* MinimizationStopName(MinimizationStop stop) {
+  switch (stop) {
+    case MinimizationStop::kNone:
+      return "skipped";
+    case MinimizationStop::kFixedPoint:
+      return "fixed_point";
+    case MinimizationStop::kBudget:
+      return "budget";
+    case MinimizationStop::kRounds:
+      return "rounds";
+    case MinimizationStop::kStopped:
+      return "stopped";
+  }
+  return "skipped";
 }
 
 int MinimizerOptions::TestsFor(uint64_t exec_time_us) const {

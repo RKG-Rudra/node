@@ -38,12 +38,30 @@ struct MinimizerOptions {
   // min_tests. 0 disables the scaling.
   uint64_t target_time_ms = 6000;
   int min_tests = 40;
+  // The part of the remaining test budget that the `expressions` reducer
+  // can use each time that it starts, from 0 to 1. 1 sets no limit. Most
+  // tests of this reducer do not keep a reduction.
+  double expressions_share = 1.0;
 
   // The test budget for a program that executes in exec_time_us.
   int TestsFor(uint64_t exec_time_us) const;
   // These options with max_tests replaced by TestsFor(exec_time_us).
   MinimizerOptions ForProgram(uint64_t exec_time_us) const;
 };
+
+// Why a minimization stopped.
+enum class MinimizationStop {
+  kNone,        // the minimizer did not run
+  kFixedPoint,  // a round of all reducers kept no more reductions
+  kBudget,      // the minimizer used up the test budget or the time budget
+  kRounds,      // the minimizer ran max_rounds rounds
+  kStopped,     // the caller stopped the minimization (the minimizer does
+                // not set this value)
+};
+
+// The name of `stop` for reports and events: "skipped", "fixed_point",
+// "budget", "rounds" or "stopped".
+const char* MinimizationStopName(MinimizationStop stop);
 
 struct MinimizationResult {
   int tests = 0;            // oracle calls
@@ -53,6 +71,7 @@ struct MinimizationResult {
   size_t nodes_after = 0;
   uint64_t time_us = 0;
   bool budget_exhausted = false;
+  MinimizationStop stop = MinimizationStop::kNone;
 };
 
 class Reducer;
@@ -70,6 +89,9 @@ class MinimizationHelper {
   // Returns false without testing once the budget is exhausted.
   bool Test();
   bool BudgetExhausted() const;
+  // The tests that remain in the test budget.
+  int TestsLeft() const;
+  const MinimizerOptions& options() const { return options_; }
   void set_reducer(Reducer* reducer) { reducer_ = reducer; }
   const MinimizationResult& result() const { return result_; }
   MinimizationResult* mutable_result() { return &result_; }
@@ -107,8 +129,12 @@ class Minimizer {
 
   // Every reducer (the components), in registration order.
   static std::vector<std::unique_ptr<Reducer>> CreateDefaultReducers();
-  // The reducers Minimize() runs when no order is configured, in order.
+  // The reducers Minimize() runs when no order is configured, in order:
+  // `dataflow` first, `truncate` not.
   static const std::vector<std::string_view>& DefaultOrder();
+  // The reducers of a crash minimization without a configured order
+  // (crash_minimizer.reducers), in order: all reducers, `dataflow` first.
+  static const std::vector<std::string_view>& CrashOrder();
 
   const MinimizerOptions& options() const { return options_; }
   const std::vector<std::unique_ptr<Reducer>>& reducers() const {
